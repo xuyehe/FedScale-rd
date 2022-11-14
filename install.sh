@@ -1,5 +1,4 @@
 #!/bin/bash
-set -Eeuo pipefail
 
 INST_CUDA=0
 INST_REDIS=0

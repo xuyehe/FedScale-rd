@@ -38,20 +38,20 @@ def load_yaml_conf(yaml_file):
     return data
 
 
-def process_cmd(yaml_file, local=False):
+def process_cmd(action, yaml_file, local=False):
 
     yaml_conf = load_yaml_conf(yaml_file)
 
     # Start redis server
-    redis_conf = yaml_conf['redis_conf']
-    redis_exec = redis_conf['redis_executable']
-    redis_host = redis_conf['redis_host']
-    redis_port = redis_conf['redis_port']
-    redis_password = redis_conf['redis_password']
-    fedscale_home = os.environ['FEDSCALE_HOME']
-    while not is_redis_server_online(redis_host, redis_port, redis_password):
-        start_redis_server(redis_exec, fedscale_home, redis_host, redis_port, redis_password)
-        time.sleep(1) # wait for server to go online
+    # redis_conf = yaml_conf['redis_conf']
+    # redis_exec = redis_conf['redis_executable']
+    # redis_host = redis_conf['redis_host']
+    # redis_port = redis_conf['redis_port']
+    # redis_password = redis_conf['redis_password']
+    # fedscale_home = os.environ['FEDSCALE_HOME']
+    # while not is_redis_server_online(redis_host, redis_port, redis_password):
+    #     start_redis_server(redis_exec, fedscale_home, redis_host, redis_port, redis_password)
+    #     time.sleep(1) # wait for server to go online
 
     if 'use_container' in yaml_conf:
         if yaml_conf['use_container'] == "docker":
@@ -65,9 +65,9 @@ def process_cmd(yaml_file, local=False):
             exit(1)
     else:
         use_container = "default"
-        
 
-    
+
+
     ps_ip = yaml_conf['ps_ip']
     worker_ips, total_gpus = [], []
     cmd_script_list = []
@@ -96,7 +96,13 @@ def process_cmd(yaml_file, local=False):
         if conf[1] is not None: # skip empty password
             job_conf.update({conf[0]: conf[1]})
 
-        
+    # for path to Redis dump
+    job_conf.update({'fedscale_home': os.environ['FEDSCALE_HOME']})
+
+    # for checkpointing
+    if action == 'resume':
+        job_conf.update({'checkpoint': True})
+
     conf_script = ''
     setup_cmd = ''
     if yaml_conf['setup_commands'] is not None:
@@ -137,6 +143,7 @@ def process_cmd(yaml_file, local=False):
     else:
         print(f"Starting aggregator on {ps_ip}...")
         ps_cmd = f" python {yaml_conf['exp_path']}/{yaml_conf['aggregator_entry']} {conf_script} --this_rank=0 --num_executors={total_gpu_processes} --executor_configs={executor_configs} "
+        # ps_cmd = f" python -m cprofilev {yaml_conf['exp_path']}/{yaml_conf['aggregator_entry']} {conf_script} --this_rank=0 --num_executors={total_gpu_processes} --executor_configs={executor_configs} "
 
     with open(f"{job_name}_logging", 'wb') as fout:
         pass
@@ -169,7 +176,7 @@ def process_cmd(yaml_file, local=False):
                         "rank_id": rank_id,
                         "cuda_id": cuda_id
                     }
-                    
+
                     worker_cmd = f" docker run -i --name fedscale-exec{rank_id}-{time_stamp} --network {yaml_conf['container_network']} -p {ports[rank_id]}:32000 --mount type=bind,source={yaml_conf['data_path']},target=/FedScale/benchmark fedscale/fedscale-exec"
                 else:
                     worker_cmd = f" python {yaml_conf['exp_path']}/{yaml_conf['executor_entry']} {conf_script} --this_rank={rank_id} --num_executors={total_gpu_processes} --cuda_device=cuda:{cuda_id} "
@@ -253,7 +260,7 @@ def process_cmd(yaml_file, local=False):
                 msg = json.dumps(msg)
                 send_socket.sendall(msg.encode('utf-8'))
                 send_socket.close()
-                break                
+                break
 
 
     print(f"Submitted job, please check your logs {job_conf['log_path']}/logs/{job_conf['job_name']}/{time_stamp} for status")
@@ -275,7 +282,7 @@ def terminate(job_name):
             print(f"Shutting down container {name} on {meta_dict['ip']}")
             with open(f"{job_name}_logging", 'a') as fout:
                 subprocess.Popen(f'ssh {job_meta["user"]}{meta_dict["ip"]} "docker rm --force {name}"',
-                                shell=True, stdout=fout, stderr=fout)          
+                                shell=True, stdout=fout, stderr=fout)
     elif job_meta['use_container'] == "k8s":
         # for now, assume we run in k8s admin mode, placeholder for client job submission in the future
         config.load_kube_config()
@@ -283,11 +290,11 @@ def terminate(job_name):
         for name, meta_dict in job_meta['k8s_dict'].items():
             if os.path.exists(meta_dict["yaml_path"]):
                 os.remove(meta_dict["yaml_path"])
-                
+
             print(f"Shutting down container {name}...")
             core_api.delete_namespaced_pod(name, namespace="default")
 
-    else:    
+    else:
         for vm_ip in job_meta['vms']:
             print(f"Shutting down job on {vm_ip}")
             with open(f"{job_name}_logging", 'a') as fout:
@@ -301,7 +308,7 @@ def submit_to_k8s(yaml_conf):
     config.load_kube_config()
     k8s_client = client.ApiClient()
     core_api = client.CoreV1Api()
-    
+
     time_stamp = datetime.datetime.fromtimestamp(
         time.time()).strftime('%m%d_%H%M%S')
     running_vms = set()
@@ -360,7 +367,7 @@ def submit_to_k8s(yaml_conf):
         print(f'Submitting executor container {exec_name} to k8s...')
         # TODO: logging?
         utils.create_from_yaml(k8s_client, exec_yaml_path, namespace="default")
-    
+
     # a cold start would take 5-6min
     print(f'Waiting aggregator container {aggr_name} to be ready...')
     aggr_ip = -1
@@ -374,7 +381,7 @@ def submit_to_k8s(yaml_conf):
     if aggr_ip == -1:
         print(f"Error: aggregator {aggr_name} not ready after maximum waiting time allowed, aborting...")
         exit(1)
-    
+
     k8s_dict[aggr_name] = {
         "type": "aggregator",
         "ip": aggr_ip,
@@ -442,19 +449,19 @@ def submit_to_k8s(yaml_conf):
             msg = json.dumps(msg)
             send_socket.sendall(msg.encode('utf-8'))
             send_socket.close()
-            break            
+            break
 
     current_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), job_name)
     with open(current_path, "wb") as fout:
         meta_data = {"user": submit_user, "k8s_dict": k8s_dict, "use_container": "k8s"}
         pickle.dump(meta_data, fout)
 
-    
+
 
 print_help: bool = False
 if len(sys.argv) > 1:
-    if sys.argv[1] == 'submit' or sys.argv[1] == 'start':
-        process_cmd(sys.argv[2], False if sys.argv[1] == 'submit' else True)
+    if sys.argv[1] == 'submit' or sys.argv[1] == 'start' or sys.argv[1] == 'resume':
+        process_cmd(sys.argv[1], sys.argv[2], False if sys.argv[1] == 'submit' or sys.argv[1] == 'resume' else True)
     elif sys.argv[1] == 'stop':
         terminate(sys.argv[2])
     else:

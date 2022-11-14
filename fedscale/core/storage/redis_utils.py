@@ -65,6 +65,9 @@ def start_redis_server(
     else:
         logging.info("Disabled protected mode since no password is set")
         command += ['--protected-mode no'] # Not safe on public internet
+    # We want to avoid any periodical save. 
+    # Instead, we want to save a snapshot of each round's data upon round completion.
+    command += ['--save \"\"']
     # start Redis Server as a subprocess
     logging.info(f'Starting Redis server at at {host}:{port}')
     subprocess.Popen(command)
@@ -99,11 +102,33 @@ def is_redis_server_online(
     else:
         logging.info(f'Failed to reach Redis server at {host}:{port} after {retry} retries')
         return False
-    
+
+def start_redis_server_until_success(
+    executable,
+    fedscale_home, 
+    host='127.0.0.1', 
+    port=6379,
+    password='',
+):
+    """Retry until successfully starts the redis server.
+
+    Args:
+        executable (string): Absolute path to the Redis executable.
+        fedscale_home (string): Absolute path to Fedscale working directory.
+        host (string, optional): IP address of the Redis server. Defaults to '127.0.0.1'.
+        port (int, optional): Port of the Redis server. Defaults to 6379.
+        password (string, optional): Password for server side authentication. Defaults to None.
+
+    """
+    while not is_redis_server_online(host, port, password):
+        start_redis_server(executable, fedscale_home, host, port, password)
+        time.sleep(1) # wait for server to go online
+
 def shutdown_server(
     host='127.0.0.1', 
     port=6379, 
     password='',
+    nosave=False
 ):
     """Shutdown the Redis server.
 
@@ -111,10 +136,11 @@ def shutdown_server(
         host (string, optional): IP address of the Redis server. Defaults to '127.0.0.1'.
         port (int, optional): Port of the Redis server. Defaults to 6379.
         password (string, optional): Password for server side authentication. Defaults to None.
+        nosave (bool, optional): Prevent DB save operation.
     """
     client = redis.Redis(host=host, port=port, password=password)
     try:
-        client.shutdown()
+        client.shutdown(nosave=nosave)
         logging.info(f'Successfully shutdown Redis server at {host}:{port}')
     except Exception:
         pass
@@ -196,11 +222,13 @@ class Redis_client():
         Returns:
             string | int | float | Any: Decoded value.
         """
-        tagged_key = key + self.tag
+        raw_val = self.get_val_raw(key)
+        if raw_val is None:
+            return None
         if type in ['bytes']:
-            return bytes_deserialize(self.r.get(tagged_key))
+            return bytes_deserialize(raw_val)
         else:
-            ret_val = self.r.get(tagged_key).decode('utf-8')
+            ret_val = raw_val.decode('utf-8')
             if type in ['string']:
                 return ret_val
             elif type in ['int']:
