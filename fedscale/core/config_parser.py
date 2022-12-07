@@ -219,6 +219,7 @@ parser.add_argument('--no-bidirectional', dest='bidirectional', action='store_fa
                     help='Turn off bi-directional RNNs, introduces lookahead convolution')
 
 # for redis conf
+parser.add_argument('--use_redis', type=bool, default=False)
 parser.add_argument('--fedscale_home', type=str)
 parser.add_argument('--redis_executable', type=str, default='/usr/bin/redis-server')
 parser.add_argument('--redis_host', type=str, default='127.0.0.1')

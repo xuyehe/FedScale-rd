@@ -16,14 +16,14 @@ from fedscale.core.channels import job_api_pb2
 from fedscale.core.resource_manager import ResourceManager
 from fedscale.core.fllibs import *
 
-from fedscale.core.storage.redis_utils import Redis_client, start_redis_server_until_success
+from fedscale.core.storage.redis_utils import Redis_client, start_redis_server_until_success, shutdown_server
 
 MAX_MESSAGE_LENGTH = 1*1024*1024*1024  # 1GB
 
 
 class Aggregator(job_api_pb2_grpc.JobServiceServicer):
     """This centralized aggregator collects training/testing feedbacks from executors
-    
+
     Args:
         args (dictionary): Variable arguments for fedscale runtime config. defaults to the setup in arg_parser.py
 
@@ -39,27 +39,29 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.device = args.cuda_device if args.use_cuda else torch.device(
             'cpu')
 
+        self.resume_checkpoint = False
+        if args.use_redis:
+            # ======== redis server ========
+            start_redis_server_until_success(args.redis_executable, args.fedscale_home, args.redis_host, args.redis_port, args.redis_password)
 
-        # ======== redis server ========
-        start_redis_server_until_success(args.redis_executable, args.fedscale_home, args.redis_host, args.redis_port, args.redis_password)
-        
-        # ======== redis client ========
-        self.redis_cli = Redis_client(args.redis_host, args.redis_port, args.redis_password, args.job_tag)
+            # ======== redis client ========
+            self.redis_cli = Redis_client(args.redis_host, args.redis_port, args.redis_password, args.job_tag)
 
-        # clear in-memory state for current job tag?
-        
+            # ======== checkpoint config ========
+            if args.checkpoint and args.use_redis:
+                # restart redis server to load state from permanent storage (.rdb)
 
-        # ======== checkpoint config ========
-        if args.checkpoint:
-            # logging.info(f"")
-            logging.info("Looking for checkpoint")
-            prev_round = self.redis_cli.get_val('round', 'int')
-            if prev_round is None or prev_round == 1:
-                logging.info("No available checkpoint found, starting from scratch")
-                # self.resume_checkpoint = False
-            else:
-                logging.info(f"Found previous round {prev_round}, resuming from that round")
-                # self.resume_checkpoint = True
+                shutdown_server(args.redis_host, args.redis_port, args.redis_password, nosave=True)
+                start_redis_server_until_success(args.redis_executable, args.fedscale_home, args.redis_host, args.redis_port, args.redis_password)
+
+                logging.info("Looking for checkpoint")
+                prev_round = self.redis_cli.get_val('round', 'int')
+                if prev_round is None or prev_round == 1:
+                    logging.info("No available checkpoint found, starting from scratch")
+                    # self.resume_checkpoint = False
+                else:
+                    logging.info(f"Found previous round {prev_round}, resuming from that round")
+                    self.resume_checkpoint = True
 
         # ======== env information ========
         self.this_rank = 0
@@ -98,10 +100,10 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         # because every participant is an executor. However, in simulation mode,
         # executors is the physical machines (VMs), thus:
         # |sampled_executors| << |sampled_participants| as an VM may run multiple participants
-        # self.sampled_participants = []
-        # self.sampled_executors = []
+        self.sampled_participants = []
+        self.sampled_executors = []
 
-        # self.round_stragglers = []
+        self.round_stragglers = []
         self.model_update_size = 0.
 
         self.collate_fn = None
@@ -111,13 +113,13 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.start_run_time = time.time()
         self.client_conf = {}
 
-        # self.stats_util_accumulator = []
-        # self.loss_accumulator = []
-        # self.client_training_results = []
+        self.stats_util_accumulator = []
+        self.loss_accumulator = []
+        self.client_training_results = []
 
         # number of registered executors
         self.registered_executor_info = set()
-        # self.test_result_accumulator = []
+        self.test_result_accumulator = []
         self.testing_history = {'data_set': args.data_set, 'model': args.model, 'sample_mode': args.sample_mode,
                                 'gradient_policy': args.gradient_policy, 'task': args.task, 'perf': collections.OrderedDict()}
 
@@ -158,11 +160,13 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 for numexe in numgpu.strip()[1:-1].split(','):
                     for _ in range(int(numexe.strip())):
                         num_of_executors += 1
-            # self.executors = list(range(num_of_executors))
-            self.redis_cli.update_list('executors', list(range(num_of_executors)), False)
+            self.executors = list(range(num_of_executors))
+            if self.args.use_redis:
+                self.redis_cli.update_list('executors', list(range(num_of_executors)), False)
         else:
-            # self.executors = list(range(self.args.num_participants))
-            self.redis_cli.update_list('executors', list(range(self.args.num_participants)), False)
+            self.executors = list(range(self.args.num_participants))
+            if self.args.use_redis:
+                self.redis_cli.update_list('executors', list(range(self.args.num_participants)), False)
 
         # initiate a server process
         self.grpc_server = grpc.server(
@@ -191,13 +195,14 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         """
         assert self.args.engine == commons.PYTORCH, "Please define model for non-PyTorch models"
 
-        # self.model = init_model()
-        md = init_model()
-        self.redis_cli.set_val('model', md, True)
+        self.model = init_model()
+        # md = init_model()
+        if self.args.use_redis:
+            self.redis_cli.set_val('model', self.model, True)
 
         # Initiate model parameters dictionary <param_name, param>
-        # self.model_weights = self.model.state_dict()
-        self.model_weights = md.state_dict()
+        self.model_weights = self.model.state_dict()
+        # self.model_weights = md.state_dict()
 
     def init_task_context(self):
         """Initiate execution context for specific tasks
@@ -213,13 +218,13 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
         Args:
             args (dictionary): Variable arguments for fedscale runtime config. defaults to the setup in arg_parser.py
-        
+
         Returns:
             clientManager: The client manager class
 
         Currently we implement two client managers:
 
-        1. Random client sampler - it selects participants randomly in each round 
+        1. Random client sampler - it selects participants randomly in each round
         [Ref]: https://arxiv.org/abs/1902.01046
 
         2. Oort sampler
@@ -254,7 +259,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def client_register_handler(self, executorId, info):
         """Triggered once receive new executor registration.
-        
+
         Args:
             executorId (int): Executor Id
             info (dictionary): Executor information
@@ -282,36 +287,36 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
     def executor_info_handler(self, executorId, info):
         """Handler for register executor info and it will start the round after number of
         executor reaches requirement.
-        
+
         Args:
             executorId (int): Executor Id
             info (dictionary): Executor information
 
         """
         self.registered_executor_info.add(executorId)
-        # logging.info(f"Received executor {executorId} information, {len(self.registered_executor_info)}/{len(self.executors)}")
-        logging.info(f"Received executor {executorId} information, {len(self.registered_executor_info)}/{self.redis_cli.list_len('executors')}")
+        logging.info(f"Received executor {executorId} information, {len(self.registered_executor_info)}/{len(self.executors)}")
+        # logging.info(f"Received executor {executorId} information, {len(self.registered_executor_info)}/{self.redis_cli.list_len('executors')}")
 
         # In this simulation, we run data split on each worker, so collecting info from one executor is enough
         # Waiting for data information from executors, or timeout
         if self.experiment_mode == commons.SIMULATION_MODE:
 
-            # if len(self.registered_executor_info) == len(self.executors):
-            if len(self.registered_executor_info) == self.redis_cli.list_len('executors'):
+            if len(self.registered_executor_info) == len(self.executors):
+            # if len(self.registered_executor_info) == self.redis_cli.list_len('executors'):
                 self.client_register_handler(executorId, info)
                 # start to sample clients
                 self.round_completion_handler()
         else:
             # In real deployments, we need to register for each client
             self.client_register_handler(executorId, info)
-            # if len(self.registered_executor_info) == len(self.executors):
-            if len(self.registered_executor_info) == self.redis_cli.list_len('executors'):
+            if len(self.registered_executor_info) == len(self.executors):
+            # if len(self.registered_executor_info) == self.redis_cli.list_len('executors'):
                 self.round_completion_handler()
 
     def tictak_client_tasks(self, sampled_clients, num_clients_to_collect):
         """Record sampled client execution information in last round. In the SIMULATION_MODE,
         further filter the sampled_client and pick the top num_clients_to_collect clients.
-        
+
         Args:
             sampled_clients (list of int): Sampled clients from client manager
             num_clients_to_collect (int): The number of clients actually needed for next round.
@@ -366,7 +371,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                     1, completionTimes)
 
     def run(self):
-        """Start running the aggregator server by setting up execution 
+        """Start running the aggregator server by setting up execution
         and communication environment, and monitoring the grpc message.
         """
         self.setup_env()
@@ -375,10 +380,10 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
         self.init_model()
         self.save_last_param()
-        # self.model_update_size = sys.getsizeof(
-        #     pickle.dumps(self.model))/1024.0*8.  # kbits
         self.model_update_size = sys.getsizeof(
-            pickle.dumps(self.redis_cli.get_val('model', 'bytes')))/1024.0*8.  # kbits
+            pickle.dumps(self.model))/1024.0*8.  # kbits
+        # self.model_update_size = sys.getsizeof(
+        #     pickle.dumps(self.redis_cli.get_val('model', 'bytes')))/1024.0*8.  # kbits
         self.client_profiles = self.load_client_profile(
             file_path=self.args.device_conf_file)
 
@@ -387,7 +392,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
     def select_participants(self, select_num_participants, overcommitment=1.3):
         """Select clients for next round.
 
-        Args: 
+        Args:
             select_num_participants (int): Number of clients to select.
             overcommitment (float): Overcommit ration for next round.
 
@@ -401,26 +406,28 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         )
 
     def client_completion_handler(self, results):
-        """We may need to keep all updates from clients, 
+        """We may need to keep all updates from clients,
         if so, we need to append results to the cache
-        
+
         Args:
             results (dictionary): client's training result
-        
+
         """
         # Format:
         #       -results = {'clientId':clientId, 'update_weight': model_param, 'moving_loss': round_train_loss,
         #       'trained_size': count, 'wall_duration': time_cost, 'success': is_success 'utility': utility}
 
         if self.args.gradient_policy in ['q-fedavg']:
-            # self.client_training_results.append(results)
-            # should push bytes
-            self.redis_cli.rpush('client_training_results', results, True)
+            self.client_training_results.append(results)
+            # if self.args.use_redis:
+            #     # should push bytes
+            #     self.redis_cli.rpush('client_training_results', results, True)
         # Feed metrics to client sampler
-        # self.stats_util_accumulator.append(results['utility'])
-        self.redis_cli.rpush('stats_util_accumulator', results['utility'], False)
-        # self.loss_accumulator.append(results['moving_loss'])
-        self.redis_cli.rpush('loss_accumulator', results['moving_loss'], False)
+        self.stats_util_accumulator.append(results['utility'])
+        self.loss_accumulator.append(results['moving_loss'])
+        # if self.args.use_redis:
+            # self.redis_cli.rpush('stats_util_accumulator', results['utility'], False)
+            # self.redis_cli.rpush('loss_accumulator', results['moving_loss'], False)
 
 
         self.client_manager.register_feedback(results['clientId'], results['utility'],
@@ -444,10 +451,10 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def aggregate_client_weights(self, results):
         """May aggregate client updates on the fly
-        
+
         Args:
             results (dictionary): client's training result
-        
+
         [FedAvg] "Communication-Efficient Learning of Deep Networks from Decentralized Data".
         H. Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, Blaise Aguera y Arcas. AISTATS, 2017
         """
@@ -475,12 +482,12 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                     self.model_weights[p]/float(self.tasks_round)).to(dtype=d_type)
 
     def aggregate_client_group_weights(self, results):
-        """Streaming weight aggregation. Similar to aggregate_client_weights, 
+        """Streaming weight aggregation. Similar to aggregate_client_weights,
         but each key corresponds to a group of weights (e.g., for Tensorflow)
-        
+
         Args:
             results (dictionary): Client's training result
-        
+
         """
         for p_g in results['update_weight']:
             param_weights = results['update_weight'][p_g]
@@ -507,23 +514,23 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
     def save_last_param(self):
         """ Save the last model parameters
         """
-        # if self.args.engine == commons.TENSORFLOW:
-        #     self.last_gradient_weights = [
-        #         layer.get_weights() for layer in self.model.layers]
-        #     self.model_weights = copy.deepcopy(self.model.state_dict())
-        # else:
-        #     self.last_gradient_weights = [
-        #         p.data.clone() for p in self.model.parameters()]
-        #     self.model_weights = copy.deepcopy(self.model.state_dict())
-        md = self.redis_cli.get_val('model', 'bytes')
         if self.args.engine == commons.TENSORFLOW:
             self.last_gradient_weights = [
-                layer.get_weights() for layer in md.layers]
-            self.model_weights = copy.deepcopy(md.state_dict())
+                layer.get_weights() for layer in self.model.layers]
+            self.model_weights = copy.deepcopy(self.model.state_dict())
         else:
             self.last_gradient_weights = [
-                p.data.clone() for p in md.parameters()]
-            self.model_weights = copy.deepcopy(md.state_dict())
+                p.data.clone() for p in self.model.parameters()]
+            self.model_weights = copy.deepcopy(self.model.state_dict())
+        # md = self.redis_cli.get_val('model', 'bytes')
+        # if self.args.engine == commons.TENSORFLOW:
+        #     self.last_gradient_weights = [
+        #         layer.get_weights() for layer in md.layers]
+        #     self.model_weights = copy.deepcopy(md.state_dict())
+        # else:
+        #     self.last_gradient_weights = [
+        #         p.data.clone() for p in md.parameters()]
+        #     self.model_weights = copy.deepcopy(md.state_dict())
 
     def update_default_task_config(self):
         """Update the default task configuration after each round
@@ -534,129 +541,150 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def round_weight_handler(self, last_model):
         """Update model when the round completes
-        
+
         Args:
             last_model (list): A list of global model weight in last round.
-        
+
         """
-        # if self.round > 1:
-        #     if self.args.engine == commons.TENSORFLOW:
-        #         for layer in self.model.layers:
-        #             layer.set_weights([p.cpu().detach().numpy()
-        #                               for p in self.model_weights[layer.name]])
-        #     else:
-        #         self.model.load_state_dict(self.model_weights)
-        #         current_grad_weights = [param.data.clone()
-        #                                 for param in self.model.parameters()]
-        #         self.optimizer.update_round_gradient(
-        #             last_model, current_grad_weights, self.model)
-        md = self.redis_cli.get_val('model', 'bytes')
         if self.round > 1:
             if self.args.engine == commons.TENSORFLOW:
-                for layer in md.layers:
+                for layer in self.model.layers:
                     layer.set_weights([p.cpu().detach().numpy()
                                       for p in self.model_weights[layer.name]])
             else:
-                md.load_state_dict(self.model_weights)
+                self.model.load_state_dict(self.model_weights)
                 current_grad_weights = [param.data.clone()
-                                        for param in md.parameters()]
+                                        for param in self.model.parameters()]
                 self.optimizer.update_round_gradient(
-                    last_model, current_grad_weights, md)
-                # now save the calculated result 'md' to Redis server
-                self.redis_cli.set_val('model', md, True)
+                    last_model, current_grad_weights, self.model)
+        # md = self.redis_cli.get_val('model', 'bytes')
+        # if self.round > 1:
+        #     if self.args.engine == commons.TENSORFLOW:
+        #         for layer in md.layers:
+        #             layer.set_weights([p.cpu().detach().numpy()
+        #                               for p in self.model_weights[layer.name]])
+        #     else:
+        #         md.load_state_dict(self.model_weights)
+        #         current_grad_weights = [param.data.clone()
+        #                                 for param in md.parameters()]
+        #         self.optimizer.update_round_gradient(
+        #             last_model, current_grad_weights, md)
+        #         # now save the calculated result 'md' to Redis server
+        if self.args.use_redis:
+            self.redis_cli.async_set_val('model', self.model, True)
 
     def round_completion_handler(self):
         """Triggered upon the round completion, it registers the last round execution info,
         broadcast new tasks for executors and select clients for next round.
         """
-        self.resume_checkpoint = False
+        # self.resume_checkpoint = False
         if not self.resume_checkpoint:
             # normal execution, with commit point
+
             self.global_virtual_clock += self.round_duration
             self.round += 1
 
             # handle the global update w/ current and last
             self.round_weight_handler(self.last_gradient_weights)
 
-            # self.redis_cli.rpush('model', self.model, True)
+            avgUtilLastround = sum(self.stats_util_accumulator) / \
+                max(1, len(self.stats_util_accumulator))
 
-            # avgUtilLastround = sum(self.stats_util_accumulator) / \
-            #     max(1, len(self.stats_util_accumulator))
-            # should read list[float]
-            stats_util_accumulator = self.redis_cli.get_list('stats_util_accumulator', 'float')
-            avgUtilLastround = sum(stats_util_accumulator) / \
-                max(1, len(stats_util_accumulator))
+            # stats_util_accumulator = self.redis_cli.get_list('stats_util_accumulator', 'float')
+            # avgUtilLastround = sum(stats_util_accumulator) / \
+            #     max(1, len(stats_util_accumulator))
 
             # assign avg reward to explored, but not ran workers
-            # for clientId in self.round_stragglers:
-            # should read list[int]
-            for clientId in self.redis_cli.get_list('round_stragglers', 'int'):
+            for clientId in self.round_stragglers:
+            # for clientId in self.redis_cli.get_list('round_stragglers', 'int'):
                 self.client_manager.register_feedback(clientId, avgUtilLastround,
                                                 time_stamp=self.round,
                                                 duration=self.virtual_client_clock[clientId]['computation'] +
                                                 self.virtual_client_clock[clientId]['communication'],
                                                 success=False)
 
-            # avg_loss = sum(self.loss_accumulator) / \
-            #     max(1, len(self.loss_accumulator))
-            loss_accumulator = self.redis_cli.get_list('loss_accumulator', 'float')
-            avg_loss = sum(loss_accumulator) / \
-                max(1, len(loss_accumulator))
-            # logging.info(f"Wall clock: {round(self.global_virtual_clock)} s, round: {self.round}, Planned participants: " +
-            #              f"{len(self.sampled_participants)}, Succeed participants: {len(self.stats_util_accumulator)}, Training loss: {avg_loss}")
+            avg_loss = sum(self.loss_accumulator) / \
+                max(1, len(self.loss_accumulator))
+            # loss_accumulator = self.redis_cli.get_list('loss_accumulator', 'float')
+            # avg_loss = sum(loss_accumulator) / \
+            #     max(1, len(loss_accumulator))
             logging.info(f"Wall clock: {round(self.global_virtual_clock)} s, round: {self.round}, Planned participants: " +
-                        f"{self.redis_cli.list_len('sampled_participants')}, Succeed participants: {len(stats_util_accumulator)}, Training loss: {avg_loss}")
+                         f"{len(self.sampled_participants)}, Succeed participants: {len(self.stats_util_accumulator)}, Training loss: {avg_loss}")
+            # logging.info(f"Wall clock: {round(self.global_virtual_clock)} s, round: {self.round}, Planned participants: " +
+            #             f"{self.redis_cli.list_len('sampled_participants')}, Succeed participants: {len(stats_util_accumulator)}, Training loss: {avg_loss}")
 
             # dump round completion information to tensorboard
-            # if len(self.loss_accumulator):
-            if len(loss_accumulator):
+            if len(self.loss_accumulator):
+            # if len(loss_accumulator):
                 self.log_train_result(avg_loss)
 
             # update select participants
-            # self.sampled_participants = self.select_participants(
+            self.sampled_participants = self.select_participants(
+                select_num_participants=self.args.num_participants, overcommitment=self.args.overcommitment)
+            (clientsToRun, round_stragglers, virtual_client_clock, round_duration, flatten_client_duration) = self.tictak_client_tasks(
+                self.sampled_participants, self.args.num_participants)
+            # sampled_participants = self.select_participants(
             #     select_num_participants=self.args.num_participants, overcommitment=self.args.overcommitment)
             # (clientsToRun, round_stragglers, virtual_client_clock, round_duration, flatten_client_duration) = self.tictak_client_tasks(
             #     self.sampled_participants, self.args.num_participants)
-            sampled_participants = self.select_participants(
-                select_num_participants=self.args.num_participants, overcommitment=self.args.overcommitment)
-            self.redis_cli.update_list('sampled_participants', sampled_participants, False)
-            (clientsToRun, round_stragglers, virtual_client_clock, round_duration, flatten_client_duration) = self.tictak_client_tasks(
-                sampled_participants, self.args.num_participants)
 
             logging.info(f"Selected participants to run: {clientsToRun}")
 
-            # TODO: Commit point here?
-            self.redis_cli.set_val('round', self.round, False)
-            self.redis_cli.set_val('global_virtual_clock', self.global_virtual_clock, False)
-            self.redis_cli.update_list('clientsToRun', clientsToRun, False)
-            self.redis_cli.set_val('virtual_client_clock', virtual_client_clock, True)
-            self.redis_cli.set_val('round_duration', round_duration, False)
-            self.redis_cli.update_list('flatten_client_duration', flatten_client_duration, False)
-
-            self.redis_cli.update_list('round_stragglers', round_stragglers, False) # not used in checkpointing
-            # Update executors and participants
             if self.experiment_mode == commons.SIMULATION_MODE:
-                # self.sampled_executors = list(
-                #     self.individual_client_events.keys())
-                self.redis_cli.update_list(
-                    'sampled_executors', list(self.individual_client_events.keys()))
+                self.sampled_executors = list(
+                    self.individual_client_events.keys())
             else:
-                # self.sampled_executors = [str(c_id)
-                #                           for c_id in sampled_participants]
-                self.redis_cli.update_list(
-                    'sampled_executors', [str(c_id) for c_id in sampled_participants])
-            # ======= Commit Point for Checkpoint =======
-            self.redis_cli.dump_to_disk()
+                self.sampled_executors = [str(c_id)
+                                          for c_id in self.sampled_participants]
+
+
+
+            # TODO: Commit point here?
+            if self.args.use_redis:
+                logging.info(f"Round completion handler saving, round = {self.round}")
+                self.redis_cli.set_val('round', self.round, False)
+                self.redis_cli.set_val('global_virtual_clock', self.global_virtual_clock, False)
+                self.redis_cli.update_list('clientsToRun', clientsToRun, False)
+                self.redis_cli.set_val('virtual_client_clock', virtual_client_clock, True)
+                self.redis_cli.update_list('stats_util_accumulator', self.stats_util_accumulator, False)
+                self.redis_cli.set_val('round_duration', round_duration, False)
+                self.redis_cli.update_list('flatten_client_duration', flatten_client_duration, False)
+                self.redis_cli.set_val('avg_loss', avg_loss, False)
+                # Update executors and participants
+                self.redis_cli.update_list('sampled_executors', self.sampled_executors, False)
+                self.redis_cli.update_list('sampled_participants', self.sampled_participants, False)
+                self.redis_cli.update_list('round_stragglers', round_stragglers, False)
+                # ======= Commit Point for Checkpoint =======
+                self.redis_cli.dump_to_disk()
+
         else:
             self.resume_checkpoint = False
 
-            # ======= Retrieve round, client, clock =======
-            self.round = self.redis_cli.get_val('round', 'int')
-            self.global_virtual_clock = self.redis_cli.get_val('global_virtual_clock', 'float')
-            clientsToRun = self.redis_cli.get_list('clientsToRun', 'int')
-            virtual_client_clock = self.redis_cli.get_val('virtual_client_clock', 'bytes')
-            round_duration = self.redis_cli.get_val('round_duration', 'float')
-            flatten_client_duration = self.redis_cli.get_list('flatten_client_duration', 'float')
+            if self.args.use_redis:
+                # logging.info("Aggr Sleeping")
+                # time.sleep(1800)
+                # ======= Retrieve round, client, clock =======
+                self.round = self.redis_cli.get_val('round', 'int')
+                logging.info(f"Round completion handler resuming, round = {self.round}")
+                self.model = self.redis_cli.get_val('model', 'bytes')
+                self.global_virtual_clock = self.redis_cli.get_val('global_virtual_clock', 'float')
+                self.sampled_participants = self.redis_cli.get_list('sampled_participants', 'int')
+                self.sampled_executors = self.redis_cli.get_list('sampled_executors', 'string')
+                clientsToRun = self.redis_cli.get_list('clientsToRun', 'int')
+                virtual_client_clock = self.redis_cli.get_val('virtual_client_clock', 'bytes')
+                # logging.info(f"Round {self.round} virtual_client_clock keys: {virtual_client_clock.keys()}")
+                round_duration = self.redis_cli.get_val('round_duration', 'float')
+                flatten_client_duration = self.redis_cli.get_list('flatten_client_duration', 'float')
+                round_stragglers = self.redis_cli.get_list('round_stragglers', 'int')
+                self.stats_util_accumulator = self.redis_cli.get_list('stats_util_accumulator', 'float')
+                avg_loss = self.redis_cli.get_val('avg_loss', 'float')
+
+                # print last round stats
+                logging.info(f"Wall clock: {round(self.global_virtual_clock)} s, round: {self.round}, Planned participants: " +
+                         f"{len(self.sampled_participants)}, Succeed participants: {len(self.stats_util_accumulator)}, Training loss: {avg_loss}")
+                logging.info(f"Selected participants to run: {clientsToRun}")
+
+
 
         # Issue requests to the resource manager; Tasks ordered by the completion time
         self.resource_manager.register_tasks(clientsToRun)
@@ -664,28 +692,32 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
 
         self.save_last_param()
-        # self.round_stragglers = round_stragglers
-        # self.redis_cli.update_list('round_stragglers', round_stragglers, False)
+        self.round_stragglers = round_stragglers
         self.virtual_client_clock = virtual_client_clock
         self.flatten_client_duration = numpy.array(flatten_client_duration)
         self.round_duration = round_duration
         self.model_in_update = 0
-        # self.test_result_accumulator = []
-        self.redis_cli.update_list('test_result_accumulator', [])
-        # self.stats_util_accumulator = []
-        self.redis_cli.update_list('stats_util_accumulator', [])
-        # self.client_training_results = []
-        self.redis_cli.update_list('client_training_results', [])
-        # self.loss_accumulator = []
-        self.redis_cli.update_list('loss_accumulator', [])        
+        self.test_result_accumulator = []
+        self.stats_util_accumulator = []
+        self.client_training_results = []
+        self.loss_accumulator = []
+
+        if self.args.use_redis:
+            # self.redis_cli.update_list('test_result_accumulator', [])
+            self.redis_cli.update_list('stats_util_accumulator', [])
+            # self.redis_cli.update_list('client_training_results', [])
+            # self.redis_cli.update_list('loss_accumulator', [])
 
         self.update_default_task_config()
         if self.round >= self.args.rounds:
+            # logging.info("Broadcasting event: SHUT DOWN")
             self.broadcast_aggregator_events(commons.SHUT_DOWN)
         elif self.round % self.args.eval_interval == 0:
+            # logging.info("Broadcasting event: TEST MODEL")
             self.broadcast_aggregator_events(commons.UPDATE_MODEL)
             self.broadcast_aggregator_events(commons.MODEL_TEST)
         else:
+            # logging.info("Broadcasting event: NEXT ROUND")
             self.broadcast_aggregator_events(commons.UPDATE_MODEL)
             self.broadcast_aggregator_events(commons.START_ROUND)
 
@@ -714,7 +746,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def deserialize_response(self, responses):
         """Deserialize the response from executor
-        
+
         Args:
             responses (byte stream): Serialized response from executor.
 
@@ -737,7 +769,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def testing_completion_handler(self, client_id, results):
         """Each executor will handle a subset of testing dataset
-        
+
         Args:
             client_id (int): The client id.
             results (dictionary): The client test results.
@@ -747,27 +779,28 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         results = results['results']
 
         # List append is thread-safe
-        # self.test_result_accumulator.append(results)
-        # should push bytes
-        self.redis_cli.rpush('test_result_accumulator', results, True)
+        self.test_result_accumulator.append(results)
+        # if self.args.use_redis:
+        #     # should push bytes
+        #     self.redis_cli.rpush('test_result_accumulator', results, True)
 
         # Have collected all testing results
 
-        # if len(self.test_result_accumulator) == len(self.executors):
-        if self.redis_cli.list_len('test_result_accumulator') == self.redis_cli.list_len('executors'):
-            
-            # aggregate_test_result(
-            #     self.test_result_accumulator, self.args.task, \
-            #     self.round, self.global_virtual_clock, self.testing_history)
+        if len(self.test_result_accumulator) == len(self.executors):
+        # if self.redis_cli.list_len('test_result_accumulator') == self.redis_cli.list_len('executors'):
+
             logger.aggregate_test_result(
-                self.redis_cli.get_list('test_result_accumulator', 'bytes'), self.args.task, \
+                self.test_result_accumulator, self.args.task, \
                 self.round, self.global_virtual_clock, self.testing_history)
+            # logger.aggregate_test_result(
+            #     self.redis_cli.get_list('test_result_accumulator', 'bytes'), self.args.task, \
+            #     self.round, self.global_virtual_clock, self.testing_history)
             # Dump the testing result
             with open(os.path.join(logger.logDir, 'testing_perf'), 'wb') as fout:
                 pickle.dump(self.testing_history, fout)
 
-            # if len(self.loss_accumulator):
-            if self.redis_cli.list_len('loss_accumulator'):
+            if len(self.loss_accumulator):
+            # if self.redis_cli.list_len('loss_accumulator'):
                 self.log_test_result()
 
             self.broadcast_events_queue.append(commons.START_ROUND)
@@ -778,25 +811,26 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
         Args:
             event (string): grpc event (e.g. MODEL_TEST, MODEL_TRAIN) to event_queue.
-        
+
         """
         self.broadcast_events_queue.append(event)
 
     def dispatch_client_events(self, event, clients=None):
         """Issue tasks (events) to clients
-        
+
         Args:
             event (string): grpc event (e.g. MODEL_TEST, MODEL_TRAIN) to event_queue.
             clients (list of int): target client ids for event.
-        
+
         """
         if clients is None:
-            # clients = self.sampled_executors
+            clients = self.sampled_executors
             # should read list[str]
-            clients = self.redis_cli.get_list('sampled_executors', 'string')
+            # clients = self.redis_cli.get_list('sampled_executors', 'string')
 
         for client_id in clients:
             self.individual_client_events[client_id].append(event)
+            # logging.info(f"Event monitor: dispatch {event} to client {client_id}")
 
     def get_client_conf(self, clientId):
         """Training configurations that will be applied on clients,
@@ -816,10 +850,10 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def create_client_task(self, executorId):
         """Issue a new client training task to specific executor
-        
+
         Args:
             executorId (int): Executor Id.
-        
+
         Returns:
             tuple: Training config for new task. (dictionary, PyTorch or TensorFlow module)
 
@@ -835,13 +869,13 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def get_test_config(self, client_id):
         """FL model testing on clients, developers can further define personalized client config here.
-        
+
         Args:
             client_id (int): The client id.
-        
+
         Returns:
             dictionary: The testing config for new task.
-        
+
         """
         return {'client_id': client_id}
 
@@ -852,15 +886,15 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             PyTorch or TensorFlow module: Based on the executor's machine learning framework, initialize and return the model for training.
 
         """
-        # return self.model
-        return self.redis_cli.get_val('model', 'bytes')
+        return self.model
+        # return self.redis_cli.get_val('model', 'bytes')
 
     def get_shutdown_config(self, client_id):
         """Shutdown config for client, developers can further define personalized client config here.
 
         Args:
             client_id (int): Client id.
-        
+
         Returns:
             dictionary: Shutdown config for new task.
 
@@ -881,7 +915,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def CLIENT_REGISTER(self, request, context):
         """FL Client register to the aggregator
-        
+
         Args:
             request (RegisterRequest): Registeration request info from executor.
 
@@ -896,6 +930,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         executor_info = self.deserialize_response(request.executor_info)
         if executor_id not in self.individual_client_events:
             # logging.info(f"Detect new client: {executor_id}, executor info: {executor_info}")
+            # logging.info(f"Detect new client: {executor_id}")
             self.individual_client_events[executor_id] = collections.deque()
         else:
             logging.info(f"Previous client: {executor_id} resumes connecting")
@@ -909,7 +944,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
     def CLIENT_PING(self, request, context):
         """Handle client ping requests
-        
+
         Args:
             request (PingRequest): Ping request info from executor.
 
@@ -921,7 +956,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         # while multiple client_id may use the same executor_id (VMs) in simulations
         executor_id, client_id = request.executor_id, request.client_id
         response_data = response_msg = commons.DUMMY_RESPONSE
-        
+
         if len(self.individual_client_events[executor_id]) == 0:
             # send dummy response
             current_event = commons.DUMMY_EVENT
@@ -950,12 +985,14 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                                           meta=response_msg, data=response_data)
         if current_event != commons.DUMMY_EVENT:
             logging.info(f"Issue EVENT ({current_event}) to EXECUTOR ({executor_id})")
-        
+        # else:
+        #     logging.info(f"Issue EVENT ({current_event}) to EXECUTOR ({executor_id})")
+
         return response
 
     def CLIENT_EXECUTE_COMPLETION(self, request, context):
         """FL clients complete the execution task.
-        
+
         Args:
             request (CompleteRequest): Complete request info from executor.
 
@@ -987,7 +1024,6 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 executor_id, event, meta_result, data_result)
         else:
             logging.error(f"Received undefined event {event} from client {client_id}")
-
         return self.CLIENT_PING(request, context)
 
     def event_monitor(self):
@@ -999,6 +1035,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             # Broadcast events to clients
             if len(self.broadcast_events_queue) > 0:
                 current_event = self.broadcast_events_queue.popleft()
+                # logging.info(f"Event monitor: Broadcasting event {current_event}")
 
                 if current_event in (commons.UPDATE_MODEL, commons.MODEL_TEST):
                     self.dispatch_client_events(current_event)
@@ -1014,12 +1051,14 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             # Handle events queued on the aggregator
             elif len(self.sever_events_queue) > 0:
                 client_id, current_event, meta, data = self.sever_events_queue.popleft()
+                # logging.info(f"Event monitor: Client {client_id} event {current_event}")
 
                 if current_event == commons.UPLOAD_MODEL:
                     self.client_completion_handler(
                         self.deserialize_response(data))
-                    # if len(self.stats_util_accumulator) == self.tasks_round:
-                    if self.redis_cli.list_len('stats_util_accumulator') == self.tasks_round:
+                    # logging.info(f"tasks_round = {self.tasks_round}, #done = {len(self.stats_util_accumulator)}")
+                    if len(self.stats_util_accumulator) == self.tasks_round:
+                    # if self.redis_cli.list_len('stats_util_accumulator') == self.tasks_round:
                         self.round_completion_handler()
 
                 elif current_event == commons.MODEL_TEST:

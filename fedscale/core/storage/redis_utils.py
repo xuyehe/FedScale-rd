@@ -1,9 +1,28 @@
 import logging
 import redis
 import pickle
-import os
 import subprocess
 import time
+from threading import Thread
+from functools import wraps
+
+
+def async_write(func):
+    """Async wrapper for write operations. Return value of func would be ignored.
+
+        Args:
+            func (((...) -> object)): Function object to be asynchronously executed.
+
+        Returns:
+            ((...) -> object): Wrapped function object.
+
+    """
+    @wraps(func)
+    def decorated(*args, **kwargs):
+        tr = Thread(target=func, args=args, kwargs=kwargs)
+        tr.start()
+    return decorated
+
 
 def bytes_serialize(data):
     """Serialize input data into bytes.
@@ -16,6 +35,7 @@ def bytes_serialize(data):
     """
     return pickle.dumps(data)
 
+
 def bytes_deserialize(data_bytes):
     """Deserialize bytes.
 
@@ -27,10 +47,11 @@ def bytes_deserialize(data_bytes):
     """
     return pickle.loads(data_bytes)
 
+
 def start_redis_server(
     executable,
-    fedscale_home, 
-    host='127.0.0.1', 
+    fedscale_home,
+    host='127.0.0.1',
     port=6379,
     password='',
 ):
@@ -65,17 +86,18 @@ def start_redis_server(
     else:
         logging.info("Disabled protected mode since no password is set")
         command += ['--protected-mode no'] # Not safe on public internet
-    # We want to avoid any periodical save. 
+    # We want to avoid any periodical save.
     # Instead, we want to save a snapshot of each round's data upon round completion.
     command += ['--save \"\"']
     # start Redis Server as a subprocess
     logging.info(f'Starting Redis server at at {host}:{port}')
     subprocess.Popen(command)
 
+
 def is_redis_server_online(
-    host='127.0.0.1', 
-    port=6379, 
-    password='', 
+    host='127.0.0.1',
+    port=6379,
+    password='',
     retry=10
 ):
     """Test if Redis server is online.
@@ -103,10 +125,11 @@ def is_redis_server_online(
         logging.info(f'Failed to reach Redis server at {host}:{port} after {retry} retries')
         return False
 
+
 def start_redis_server_until_success(
     executable,
-    fedscale_home, 
-    host='127.0.0.1', 
+    fedscale_home,
+    host='127.0.0.1',
     port=6379,
     password='',
 ):
@@ -124,9 +147,10 @@ def start_redis_server_until_success(
         start_redis_server(executable, fedscale_home, host, port, password)
         time.sleep(1) # wait for server to go online
 
+
 def shutdown_server(
-    host='127.0.0.1', 
-    port=6379, 
+    host='127.0.0.1',
+    port=6379,
     password='',
     nosave=False
 ):
@@ -136,18 +160,20 @@ def shutdown_server(
         host (string, optional): IP address of the Redis server. Defaults to '127.0.0.1'.
         port (int, optional): Port of the Redis server. Defaults to 6379.
         password (string, optional): Password for server side authentication. Defaults to None.
-        nosave (bool, optional): Prevent DB save operation.
+        nosave (bool, optional): If true, prevent DB from saving to disk before shutdown.
     """
     client = redis.Redis(host=host, port=port, password=password)
     try:
         client.shutdown(nosave=nosave)
         logging.info(f'Successfully shutdown Redis server at {host}:{port}')
     except Exception:
+        logging.info(f'Failed to shutdown Redis server at {host}:{port}')
         pass
 
+
 def clear_all_keys(
-    host='127.0.0.1', 
-    port=6379, 
+    host='127.0.0.1',
+    port=6379,
     password='',
 ):
     """Delete all keys in the Redis server.
@@ -164,12 +190,13 @@ def clear_all_keys(
     except Exception:
         pass
 
+
 class Redis_client():
     '''Create a redis client connected to specified server.'''
 
     def __init__(self, host='localhost', port=6379, password='', tag=''):
         """Initialize the redis client.
-        
+
         Args:
             host (string, optional): IP address of the Redis server. Defaults to '127.0.0.1'.
             port (int, optional): Port of the Redis server. Defaults to 6379.
@@ -197,7 +224,7 @@ class Redis_client():
         Args:
             key (string): Key for referencing value.
             val (Any): The value to be saved.
-            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False. 
+            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False.
                                     Defaults to False.
 
         Returns:
@@ -208,6 +235,19 @@ class Redis_client():
             return self.r.set(tagged_key, val)
         else:
             return self.r.set(tagged_key, bytes_serialize(val))
+
+    @async_write
+    def async_set_val(self, key, val, bytes=False):
+        """Asynchronously save the value with specified key into Redis server.
+
+        Args:
+            key (string): Key for referencing value.
+            val (Any): The value to be saved.
+            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False.
+                                    Defaults to False.
+        """
+        self.set_val(key, val, bytes)
+
 
     def get_val(self, key, type):
         """Get the value specified by key and decode it.
@@ -237,7 +277,7 @@ class Redis_client():
                 return float(ret_val)
             else:
                 raise ValueError(f'Unrecognized type: {type}')
-    
+
     def get_val_raw(self, key):
         """Get the raw value specified by key, i.e. undecoded response.
 
@@ -266,14 +306,14 @@ class Redis_client():
         """Save the current in-memory database into disk.
         """
         self.r.bgsave()
-    
+
     def update_list(self, key, lst: list, bytes=False):
         """Update list with specified key in Redis server.
 
         Args:
             key (string): Key for referencing the list.
             lst (list of any): List to be saved.
-            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False. 
+            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False.
                                     Defaults to False.
 
         Raises:
@@ -295,6 +335,21 @@ class Redis_client():
         else:
             self.r.delete(tagged_key)
             return self.r.rpush(tagged_key, [bytes_serialize(s) for s in lst])
+
+    @async_write
+    def async_update_list(self, key, lst: list, bytes=False):
+        """Asynchronously update list with specified key in Redis server.
+
+        Args:
+            key (string): Key for referencing the list.
+            lst (list of any): List to be saved.
+            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False.
+                                    Defaults to False.
+
+        Raises:
+            ValueError: Raised if key does not refer to a list or empty value in Redis.
+        """
+        self.update_list(key, lst, bytes)
 
     def get_list(self, key, type):
         """Get the list with specified value, and decode each element in it.
@@ -328,7 +383,7 @@ class Redis_client():
                 return [float(f) for f in ret_list]
             else:
                 raise ValueError(f'Unrecognized type: {type}')
-    
+
     def get_list_raw(self, key):
         """Get the undecoded list specified by key.
 
@@ -352,7 +407,7 @@ class Redis_client():
         Args:
             key (string): Key for referencing the list.
             val (Any): The value to be pushed into the list.
-            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False. 
+            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False.
                                     Defaults to False.
 
         Raises:
@@ -368,6 +423,22 @@ class Redis_client():
             return self.r.rpush(tagged_key, val)
         else:
             return self.r.rpush(tagged_key, bytes_serialize(val))
+
+    @async_write
+    def async_rpush(self, key, val, bytes=False):
+        """Asynchronously push the value to the right of the list.
+
+        Args:
+            key (string): Key for referencing the list.
+            val (Any): The value to be pushed into the list.
+            bytes (bool, optional): Set to True if input needs to be serialized, otherwise set to False.
+                                    Defaults to False.
+
+        Raises:
+            ValueError: Raised if key does not refer to a list or empty value in Redis.
+        """
+        self.rpush(key, val, bytes)
+
 
     def list_len(self, key):
         """Get the length of the list specified by key.
@@ -401,7 +472,7 @@ class Redis_client():
         tagged_key = key + self.tag
         return self.r.exists(tagged_key)
 
-    def type(self, key):
+    def get_type(self, key):
         """Get the type of the key in string.
 
         Args:
@@ -420,14 +491,3 @@ class Redis_client():
             Redis: Redis client object.
         """
         return self.r
-
-
-
-
-# test server start 
-if __name__ == '__main__':
-    redis_exec = '/usr/bin/redis-server'
-    fedscale_home = os.environ['FEDSCALE_HOME']
-    # print(fedscale_home)
-    if not is_redis_server_online():
-        start_redis_server(redis_exec, fedscale_home)
