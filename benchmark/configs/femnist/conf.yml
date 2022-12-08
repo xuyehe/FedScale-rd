@@ -1,14 +1,14 @@
 # Configuration file of FAR training experiment
 
-# ========== Cluster configuration ========== 
+# ========== Cluster configuration ==========
 # ip address of the parameter server (need 1 GPU process)
-ps_ip: 10.0.0.4
+ps_ip: 10.0.0.1
 
 # ip address of each worker:# of available gpus process on each gpu in this node
 # Note that if we collocate ps and worker on same GPU, then we need to decrease this number of available processes on that GPU by 1
 # E.g., master node has 4 available processes, then 1 for the ps, and worker should be set to: worker:3
 worker_ips:
-    - 10.0.0.4:[4]
+    - 10.0.0.1:[4]
 
 exp_path: $FEDSCALE_HOME/fedscale/core
 
@@ -25,10 +25,10 @@ auth:
 setup_commands:
     - source $HOME/anaconda3/bin/activate fedscale
 
-# ========== Additional job configuration ========== 
+# ========== Additional job configuration ==========
 # Default parameters are specified in config_parser.py, wherein more description of the parameter can be found
 
-job_conf: 
+job_conf:
     - job_name: femnist                   # Generate logs under this folder: log_path/job_name/time_stamp
     - log_path: $FEDSCALE_HOME/benchmark # Path of log files
     - num_participants: 50                  # Number of participants per round, we use K=100 in our paper, large K will be much slower
@@ -48,11 +48,3 @@ job_conf:
     - batch_size: 20
     - test_bsz: 20
     - use_cuda: True
-
-# ========== Redis configuration ========== 
-redis_conf:
-    redis_executable: /usr/bin/redis-server
-    redis_host: 10.0.0.4
-    redis_port: 6379
-    redis_password: abc # Use ~ to skip password
-    job_tag: _femnist_1

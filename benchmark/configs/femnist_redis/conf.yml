@@ -56,4 +56,5 @@ redis_conf:
     redis_host: 10.0.0.1
     redis_port: 6379
     redis_password: abc # Use ~ to skip password
+    dump_interval: 1
     job_tag: _femnist_1

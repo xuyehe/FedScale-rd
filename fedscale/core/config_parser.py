@@ -226,6 +226,7 @@ parser.add_argument('--redis_host', type=str, default='127.0.0.1')
 parser.add_argument('--redis_port', type=int, default=6379)
 parser.add_argument('--redis_password', type=str, default='')
 parser.add_argument('--job_tag', type=str, default='')
+parser.add_argument('--dump_interval', type=int, default=5)
 
 # checkpoint
 parser.add_argument('--checkpoint', type=bool, default=False)

@@ -55,7 +55,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 start_redis_server_until_success(args.redis_executable, args.fedscale_home, args.redis_host, args.redis_port, args.redis_password)
 
                 logging.info("Looking for checkpoint")
-                prev_round = self.redis_cli.get_val('round', 'int')
+                prev_round = self.redis_cli.get_val('round', type=int)
                 if prev_round is None or prev_round == 1:
                     logging.info("No available checkpoint found, starting from scratch")
                     # self.resume_checkpoint = False
@@ -630,6 +630,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
             logging.info(f"Selected participants to run: {clientsToRun}")
 
+            # Update executors and participants
             if self.experiment_mode == commons.SIMULATION_MODE:
                 self.sampled_executors = list(
                     self.individual_client_events.keys())
@@ -637,19 +638,18 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 self.sampled_executors = [str(c_id)
                                           for c_id in self.sampled_participants]
 
-
-
-            # TODO: Commit point here?
-            if self.args.use_redis:
+            # Commit point
+            if self.args.use_redis and self.round % self.args.dump_interval == 0:
                 logging.info(f"Round completion handler saving, round = {self.round}")
+                self.redis_cli.set_val('learning_rate', self.args.learning_rate, False)
                 self.redis_cli.set_val('round', self.round, False)
                 self.redis_cli.set_val('global_virtual_clock', self.global_virtual_clock, False)
-                self.redis_cli.update_list('clientsToRun', clientsToRun, False)
                 self.redis_cli.set_val('virtual_client_clock', virtual_client_clock, True)
-                self.redis_cli.update_list('stats_util_accumulator', self.stats_util_accumulator, False)
                 self.redis_cli.set_val('round_duration', round_duration, False)
+                self.redis_cli.set_val('avg_loss', avg_loss, False) # for log print
+                self.redis_cli.update_list('clientsToRun', clientsToRun, False)
+                self.redis_cli.set_val('stats_util_accumulator_len', len(self.stats_util_accumulator), False) # for log print
                 self.redis_cli.update_list('flatten_client_duration', flatten_client_duration, False)
-                self.redis_cli.set_val('avg_loss', avg_loss, False)
                 # Update executors and participants
                 self.redis_cli.update_list('sampled_executors', self.sampled_executors, False)
                 self.redis_cli.update_list('sampled_participants', self.sampled_participants, False)
@@ -661,27 +661,26 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             self.resume_checkpoint = False
 
             if self.args.use_redis:
-                # logging.info("Aggr Sleeping")
-                # time.sleep(1800)
                 # ======= Retrieve round, client, clock =======
-                self.round = self.redis_cli.get_val('round', 'int')
+                self.args.learning_rate = self.redis_cli.get_val('learning_rate', type=float)
+                self.model = self.redis_cli.get_val('model', type=bytes)
+                self.round = self.redis_cli.get_val('round', type=int)
                 logging.info(f"Round completion handler resuming, round = {self.round}")
-                self.model = self.redis_cli.get_val('model', 'bytes')
-                self.global_virtual_clock = self.redis_cli.get_val('global_virtual_clock', 'float')
-                self.sampled_participants = self.redis_cli.get_list('sampled_participants', 'int')
-                self.sampled_executors = self.redis_cli.get_list('sampled_executors', 'string')
-                clientsToRun = self.redis_cli.get_list('clientsToRun', 'int')
-                virtual_client_clock = self.redis_cli.get_val('virtual_client_clock', 'bytes')
-                # logging.info(f"Round {self.round} virtual_client_clock keys: {virtual_client_clock.keys()}")
-                round_duration = self.redis_cli.get_val('round_duration', 'float')
-                flatten_client_duration = self.redis_cli.get_list('flatten_client_duration', 'float')
-                round_stragglers = self.redis_cli.get_list('round_stragglers', 'int')
-                self.stats_util_accumulator = self.redis_cli.get_list('stats_util_accumulator', 'float')
-                avg_loss = self.redis_cli.get_val('avg_loss', 'float')
-
+                # client and clock
+                self.global_virtual_clock = self.redis_cli.get_val('global_virtual_clock', type=float)
+                virtual_client_clock = self.redis_cli.get_val('virtual_client_clock', type=bytes)
+                round_duration = self.redis_cli.get_val('round_duration', type=float)
+                avg_loss = self.redis_cli.get_val('avg_loss', type=float)
+                clientsToRun = self.redis_cli.get_list('clientsToRun', type=int)
+                stats_util_accumulator_len = self.redis_cli.get_val('stats_util_accumulator_len', type=int)
+                flatten_client_duration = self.redis_cli.get_list('flatten_client_duration', type=float)
+                # sampled executors and participants
+                self.sampled_executors = self.redis_cli.get_list('sampled_executors', type=str)
+                self.sampled_participants = self.redis_cli.get_list('sampled_participants', type=int)
+                round_stragglers = self.redis_cli.get_list('round_stragglers', type=int)
                 # print last round stats
                 logging.info(f"Wall clock: {round(self.global_virtual_clock)} s, round: {self.round}, Planned participants: " +
-                         f"{len(self.sampled_participants)}, Succeed participants: {len(self.stats_util_accumulator)}, Training loss: {avg_loss}")
+                         f"{len(self.sampled_participants)}, Succeed participants: {stats_util_accumulator_len}, Training loss: {avg_loss}")
                 logging.info(f"Selected participants to run: {clientsToRun}")
 
 
@@ -701,12 +700,6 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.stats_util_accumulator = []
         self.client_training_results = []
         self.loss_accumulator = []
-
-        if self.args.use_redis:
-            # self.redis_cli.update_list('test_result_accumulator', [])
-            self.redis_cli.update_list('stats_util_accumulator', [])
-            # self.redis_cli.update_list('client_training_results', [])
-            # self.redis_cli.update_list('loss_accumulator', [])
 
         self.update_default_task_config()
         if self.round >= self.args.rounds:

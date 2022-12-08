@@ -249,12 +249,12 @@ class Redis_client():
         self.set_val(key, val, bytes)
 
 
-    def get_val(self, key, type):
+    def get_val(self, key, type=str):
         """Get the value specified by key and decode it.
 
         Args:
             key (string): Key for referencing value.
-            type (string): Type of the value.
+            type (Type): Python type for casting value.
 
         Raises:
             ValueError: Raised if type is not one of four options: string | int | float | bytes.
@@ -265,16 +265,12 @@ class Redis_client():
         raw_val = self.get_val_raw(key)
         if raw_val is None:
             return None
-        if type in ['bytes']:
+        if type in [bytes]:
             return bytes_deserialize(raw_val)
         else:
             ret_val = raw_val.decode('utf-8')
-            if type in ['string']:
-                return ret_val
-            elif type in ['int']:
-                return int(ret_val)
-            elif type in ['float']:
-                return float(ret_val)
+            if type in [int, float, str]:
+                return type(ret_val)
             else:
                 raise ValueError(f'Unrecognized type: {type}')
 
@@ -351,36 +347,35 @@ class Redis_client():
         """
         self.update_list(key, lst, bytes)
 
-    def get_list(self, key, type):
+    def get_list(self, key, type=str):
         """Get the list with specified value, and decode each element in it.
 
         Args:
             key (string): Key for referencing the list.
-            type (string): Type of the elements in the list.
+            type (Type): Python type for casting value.
 
         Raises:
             ValueError: Raised if key refers to an non-empty value which is not a list.
-            ValueError: Raised if type is not one of four options: string | int | float | bytes.
+            ValueError: Raised if type is not one of four options: str | int | float | bytes.
 
         Returns:
             list of string | list of int | list of float | list of Any: Decoded list.
         """
         tagged_key = key + self.tag
-        if self.r.type(tagged_key) in [b'none']:
+        valtype = self.r.type(tagged_key)
+        if valtype in [b'none']:
             # return empty list if list length is 0
             return []
-        elif self.r.type(tagged_key) not in [b'list']:
+        elif valtype not in [b'list']:
             raise ValueError(f'Key {key} is not a list')
-        if type in ['bytes']:
+        if type in [bytes]:
             return [bytes_deserialize(s) for s in self.r.lrange(tagged_key, 0, -1)]
         else:
             ret_list = [s.decode('utf-8') for s in self.r.lrange(tagged_key, 0, -1)]
-            if type in ['string']:
+            if type in [str]:
                 return ret_list
-            elif type in ['int']:
-                return [int(i) for i in ret_list]
-            elif type in ['float']:
-                return [float(f) for f in ret_list]
+            elif type in [int, float]:
+                return [type(i) for i in ret_list]
             else:
                 raise ValueError(f'Unrecognized type: {type}')
 
@@ -453,10 +448,11 @@ class Redis_client():
             int: Number of elements in the list.
         """
         tagged_key = key + self.tag
-        if self.r.type(tagged_key) in [b'none']:
+        valtype = self.r.type(tagged_key)
+        if valtype in [b'none']:
             # return 0 if list length is 0, i.e. no list/empty list exists
             return 0
-        elif self.r.type(tagged_key) not in [b'list']:
+        elif valtype not in [b'list']:
             raise ValueError(f'Key {key} is not a list')
         return self.r.llen(tagged_key)
 
